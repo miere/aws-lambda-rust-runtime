@@ -8,3 +8,12 @@ lambda.zip
 
 # output.json from example docs
 output.json
+
+# IntelliJ assets
+.idea
+*.iml
+
+# Eclipse assets
+.classpath
+.project
+
