@@ -40,8 +40,10 @@
 //! [`#[tokio::main]`]: https://docs.rs/tokio/0.2.21/tokio/attr.main.html
 //! [Tokio]: https://docs.rs/tokio/
 pub use crate::types::Context;
-use client::Client;
+pub use crate::error::Error;
 pub use netlify_lambda_attributes::lambda;
+
+use client::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     convert::{TryFrom, TryInto},
@@ -57,15 +59,17 @@ mod requests;
 mod simulated;
 /// Types available to a Lambda function.
 mod types;
+mod error;
 
 use requests::{EventCompletionRequest, EventErrorRequest, IntoRequest, NextEventRequest};
 use types::Diagnostic;
+use crate::error::IntoError;
 
 static DEFAULT_LOG_GROUP: &str = "/aws/lambda/Functions";
 static DEFAULT_LOG_STREAM: &str = "$LATEST";
 
 /// Error type that lambdas may result in
-pub(crate) type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+//pub(crate) type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Configuration derived from environment variables.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -101,10 +105,8 @@ impl Config {
 
 /// A trait describing an asynchronous function `A` to `B`.
 pub trait Handler<A, B> {
-    /// Errors returned by this handler.
-    type Error;
     /// Response of this handler.
-    type Fut: Future<Output = Result<B, Self::Error>>;
+    type Fut: Future<Output = Result<B, Error>>;
     /// Handle the incoming event.
     fn call(&mut self, event: A, context: Context) -> Self::Fut;
 }
@@ -124,13 +126,11 @@ pub struct HandlerFn<F> {
     f: F,
 }
 
-impl<F, A, B, Error, Fut> Handler<A, B> for HandlerFn<F>
+impl<F, A, B, Fut> Handler<A, B> for HandlerFn<F>
 where
     F: Fn(A, Context) -> Fut,
     Fut: Future<Output = Result<B, Error>> + Send,
-    Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>> + fmt::Display,
 {
-    type Error = Error;
     type Fut = Fut;
     fn call(&mut self, req: A, ctx: Context) -> Self::Fut {
         (self.f)(req, ctx)
@@ -161,7 +161,6 @@ where
 pub async fn run<A, B, F>(handler: F) -> Result<(), Error>
 where
     F: Handler<A, B>,
-    <F as Handler<A, B>>::Error: fmt::Debug,
     A: for<'de> Deserialize<'de>,
     B: Serialize,
 {
@@ -180,7 +179,6 @@ where
 pub async fn run_simulated<A, B, F>(handler: F, url: &str) -> Result<(), Error>
 where
     F: Handler<A, B>,
-    <F as Handler<A, B>>::Error: fmt::Debug,
     A: for<'de> Deserialize<'de>,
     B: Serialize,
 {
@@ -203,14 +201,14 @@ fn incoming(client: &Client) -> impl Stream<Item = Result<http::Response<hyper::
     }
 }
 
-async fn run_inner<A, B, F>(
+async fn run_inner<A, B, E, F>(
     client: &Client,
-    incoming: impl Stream<Item = Result<http::Response<hyper::Body>, Error>>,
+    incoming: impl Stream<Item = Result<http::Response<hyper::Body>, E>>,
     handler: &mut F,
 ) -> Result<(), Error>
 where
     F: Handler<A, B>,
-    <F as Handler<A, B>>::Error: fmt::Debug,
+    E: IntoError,
     A: for<'de> Deserialize<'de>,
     B: Serialize,
 {
@@ -232,10 +230,7 @@ where
             Ok(res) => EventCompletionRequest { request_id, body: res }.into_req()?,
             Err(e) => EventErrorRequest {
                 request_id,
-                diagnostic: Diagnostic {
-                    error_message: format!("{:?}", e),
-                    error_type: type_name_of_val(e).to_owned(),
-                },
+                diagnostic: e.into_error().into(),
             }
             .into_req()?,
         };
@@ -245,6 +240,7 @@ where
     Ok(())
 }
 
+// FIXME: delete me
 fn type_name_of_val<T>(_: T) -> &'static str {
     std::any::type_name::<T>()
 }
